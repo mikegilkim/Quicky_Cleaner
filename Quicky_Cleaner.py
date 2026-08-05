@@ -2,9 +2,10 @@ import sys
 import os
 import shutil
 import json
+import ctypes
 from datetime import datetime
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QProgressBar, QFrame, QMessageBox, QCheckBox,
@@ -53,12 +54,49 @@ class WorkerThread(QThread):
                                 continue
                             yield fp
 
+    def _query_recycle_bin(self, path=None):
+        try:
+            class SHQUERYRBINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.c_ulong),
+                    ("i64Size", ctypes.c_longlong),
+                    ("i64NumItems", ctypes.c_longlong),
+                ]
+
+            info = SHQUERYRBINFO()
+            info.cbSize = ctypes.sizeof(info)
+            target = path if path else None
+            if ctypes.windll.shell32.SHQueryRecycleBinW(target, ctypes.byref(info)) != 0:
+                return {"size": 0, "count": 0}
+            return {"size": max(0, int(info.i64Size)), "count": max(0, int(info.i64NumItems))}
+        except Exception:
+            return {"size": 0, "count": 0}
+
+    def _empty_recycle_bin(self, path=None):
+        try:
+            SHERB_NOCONFIRMATION = 0x00000001
+            SHERB_NOPROGRESSUI = 0x00000002
+            SHERB_NOSOUND = 0x00000004
+            info = self._query_recycle_bin(path)
+            target = path if path else None
+            ctypes.windll.shell32.SHEmptyRecycleBinW(target, None, SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND)
+            return info
+        except Exception:
+            return {"size": 0, "count": 0}
+
     def run(self):
         if self.mode == "scan":
             results = {}
             total_bytes = 0
             file_map = {}
             for category, paths in self.targets.items():
+                if category == "Recycle Bin":
+                    rb_info = self._query_recycle_bin(paths[0])
+                    results[category] = rb_info["size"]
+                    file_map[category] = []
+                    total_bytes += rb_info["size"]
+                    continue
+
                 cat_bytes = 0
                 files = []
                 for fp in self._gather_paths(paths):
@@ -78,6 +116,12 @@ class WorkerThread(QThread):
             moved_files = 0
             os.makedirs(self.quarantine_dir, exist_ok=True)
             for category, paths in self.targets.items():
+                if category == "Recycle Bin":
+                    rb_info = self._empty_recycle_bin(paths[0])
+                    moved_files += rb_info["count"]
+                    moved_bytes += rb_info["size"]
+                    continue
+
                 for fp in self._gather_paths(paths):
                     try:
                         sz = os.path.getsize(fp)
@@ -110,8 +154,9 @@ class WorkerThread(QThread):
 class MinimalistCleaner(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Purge MVP")
+        self.setWindowTitle("Quicky Cleaner")
         self.resize(500, 620)
+        self.setWindowIcon(QIcon(os.path.join(os.path.dirname(__file__), "icon.png")))
         
         # Targets Setup
         local_appdata = os.environ.get("LOCALAPPDATA", "")
@@ -122,7 +167,8 @@ class MinimalistCleaner(QMainWindow):
             "Google Chrome Cache": [os.path.join(local_appdata, r"Google\Chrome\User Data")],
             "Mozilla Firefox Cache": [os.path.join(local_appdata, r"Mozilla\Firefox\Profiles")],
             "User Application Temp": [os.path.join(local_appdata, "Temp")],
-            "Downloads": [os.path.join(user_home, "Downloads")]
+            "Downloads": [os.path.join(user_home, "Downloads")],
+            "Recycle Bin": [os.path.join(os.environ.get("SystemDrive", "C:"), r"$Recycle.Bin")]
         }
 
         # Settings / state
@@ -132,6 +178,7 @@ class MinimalistCleaner(QMainWindow):
         self.quarantine_dir = os.path.join(self.repo_dir, "quarantine")
         self.excludes = []
         self.last_file_map = {}
+        self.last_results = {}
         self.scanned_bytes = 0
         self._load_settings()
         self.init_ui()
@@ -140,49 +187,81 @@ class MinimalistCleaner(QMainWindow):
         # Apply dark theme styling
         self.setStyleSheet("""
             QMainWindow {
-                background-color: #0F172A;
+                background-color: #090B14;
             }
             QLabel {
-                color: #F8FAFC;
+                color: #E2E8F0;
                 font-family: 'Segoe UI', -apple-system, sans-serif;
             }
             QFrame#card {
-                background-color: #1E293B;
-                border-radius: 12px;
-                border: 1px solid #334155;
+                background-color: rgba(15, 23, 42, 0.94);
+                border-radius: 16px;
+                border: 1px solid rgba(148, 163, 184, 0.12);
             }
             QTableWidget {
                 background-color: transparent;
                 gridline-color: transparent;
                 border: none;
-                color: #CBD5E1;
+                color: #E2E8F0;
                 font-size: 13px;
             }
             QTableWidget::item {
-                padding: 10px 5px;
-                border-bottom: 1px solid #334155;
+                padding: 12px 0;
+                border-bottom: 1px solid rgba(148, 163, 184, 0.08);
             }
             QTableWidget::item:selected {
-                background-color: transparent;
+                background-color: rgba(56, 189, 248, 0.14);
                 color: #F8FAFC;
             }
             QHeaderView::section {
                 background-color: transparent;
-                color: #64748B;
+                color: #94A3B8;
                 font-size: 11px;
-                font-weight: bold;
+                font-weight: 600;
                 border: none;
-                padding-bottom: 8px;
+                padding-bottom: 12px;
             }
             QProgressBar {
                 border: none;
-                background-color: #334155;
+                background-color: rgba(148, 163, 184, 0.12);
                 height: 4px;
                 border-radius: 2px;
             }
             QProgressBar::chunk {
-                background-color: #3B82F6;
+                background-color: #38BDF8;
                 border-radius: 2px;
+            }
+            QPushButton {
+                background-color: transparent;
+                color: #F8FAFC;
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                padding: 12px 18px;
+                border-radius: 14px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                border-color: rgba(56, 189, 248, 0.65);
+                background-color: rgba(56, 189, 248, 0.12);
+            }
+            QPushButton:disabled {
+                color: #64748B;
+                border-color: rgba(100, 116, 139, 0.18);
+                background-color: rgba(15, 23, 42, 0.7);
+            }
+            QCheckBox {
+                spacing: 10px;
+                color: #CBD5E1;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 4px;
+                border: 1px solid rgba(148, 163, 184, 0.4);
+                background: transparent;
+            }
+            QCheckBox::indicator:checked {
+                border-color: #38BDF8;
+                background-color: #38BDF8;
             }
         """)
 
@@ -193,15 +272,18 @@ class MinimalistCleaner(QMainWindow):
         main_layout.setSpacing(20)
 
         # Header Section
-        header_layout = QVBoxLayout()
-        title = QLabel("Purge")
-        title.setFont(QFont("Segoe UI", 22, QFont.Weight.Bold))
-        
-        subtitle = QLabel("Lightweight system optimizer")
-        subtitle.setStyleSheet("color: #94A3B8; font-size: 13px;")
+        header_layout = QHBoxLayout()
 
-        header_layout.addWidget(title)
-        header_layout.addWidget(subtitle)
+        title_layout = QVBoxLayout()
+        title = QLabel("Quicky Cleaner")
+        title.setFont(QFont("Segoe UI", 22, QFont.Weight.Bold))
+        subtitle = QLabel("Lightweight Windows cleanup utility")
+        subtitle.setStyleSheet("color: #94A3B8; font-size: 13px;")
+        title_layout.addWidget(title)
+        title_layout.addWidget(subtitle)
+
+        header_layout.addLayout(title_layout)
+        header_layout.addStretch()
         main_layout.addLayout(header_layout)
 
         # Storage Summary Card
@@ -231,18 +313,21 @@ class MinimalistCleaner(QMainWindow):
         self.table = QTableWidget(len(self.targets), 3)
         self.table.setHorizontalHeaderLabels(["ENABLED", "CATEGORY", "SIZE"])
         self.checkboxes = []
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.table.setShowGrid(False)
+        self.table.setFrameShape(QFrame.Shape.NoFrame)
 
         # Initialize table placeholders
         for idx, cat in enumerate(self.targets.keys()):
             cb = QCheckBox()
             cb.setChecked(True)
+            cb.stateChanged.connect(self._update_clean_button)
             self.table.setCellWidget(idx, 0, cb)
             self.checkboxes.append(cb)
             self.table.setItem(idx, 1, QTableWidgetItem(cat))
@@ -316,6 +401,21 @@ class MinimalistCleaner(QMainWindow):
         exclude_layout.addWidget(self.exclude_btn)
         main_layout.addLayout(exclude_layout)
 
+        # Credits
+        credits = QLabel('<a href="https://www.facebook.com/mikegilkim" style="color:#38BDF8; text-decoration:none;">Follow mikegilkim</a>')
+        credits.setOpenExternalLinks(True)
+        credits.setStyleSheet("color: #94A3B8; font-size: 12px; margin-top: 12px;")
+        main_layout.addWidget(credits)
+
+    def _update_clean_button(self, state=None):
+        enable_clean = False
+        if self.last_results:
+            for idx, cat in enumerate(self.targets.keys()):
+                if self.checkboxes[idx].isChecked() and self.last_results.get(cat, 0) > 0:
+                    enable_clean = True
+                    break
+        self.clean_btn.setEnabled(enable_clean)
+
     def format_bytes(self, size_bytes):
         if size_bytes == 0:
             return "0.00 MB"
@@ -339,16 +439,13 @@ class MinimalistCleaner(QMainWindow):
         self.scanned_bytes = total_bytes
         self.size_display.setText(self.format_bytes(total_bytes))
         self.last_file_map = file_map
+        self.last_results = results
 
         for idx, (cat, cat_bytes) in enumerate(results.items()):
-            self.table.item(idx, 2).setText(self.format_bytes(cat_bytes))
-            # enable clean button only if at least one selected category has bytes
-        enable_clean = False
-        for idx, cat in enumerate(results.keys()):
-            if self.checkboxes[idx].isChecked() and results.get(cat, 0) > 0:
-                enable_clean = True
-                break
-        self.clean_btn.setEnabled(enable_clean)
+            item = self.table.item(idx, 2)
+            if item:
+                item.setText(self.format_bytes(cat_bytes))
+        self._update_clean_button()
 
     def start_clean(self):
         resp = QMessageBox.question(
